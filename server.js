@@ -2,6 +2,7 @@ import express from "express";
 import crypto from "crypto";
 import sharp from "sharp";
 import { Storage } from "@google-cloud/storage";
+import path from "path";
 
 const app = express();
 
@@ -20,7 +21,7 @@ let originals;
 let cache;
 
 /**
- * Lazy-init GCS (IMPORTANT for Cloud Run startup)
+ * Lazy initialize GCS (avoids Cloud Run cold-start failure)
  */
 function initGCS() {
   if (!storage) {
@@ -32,20 +33,47 @@ function initGCS() {
 }
 
 /**
- * Generate deterministic cache key
+ * Generate cache key for resized images
  */
-function cacheKey(path, query) {
+function cacheKey(filePath, query) {
   return (
     "cache/" +
     crypto
       .createHash("md5")
-      .update(path + JSON.stringify(query))
+      .update(filePath + JSON.stringify(query))
       .digest("hex")
   );
 }
 
 /**
- * Main handler
+ * MIME type resolver for non-image assets
+ */
+function getMimeType(filePath) {
+  switch (path.extname(filePath).toLowerCase()) {
+    case ".mp4":
+    case ".m4v":
+      return "video/mp4";
+    case ".webm":
+      return "video/webm";
+    case ".mov":
+      return "video/quicktime";
+    case ".mkv":
+      return "video/x-matroska";
+    case ".avi":
+      return "video/x-msvideo";
+    case ".flv":
+      return "video/x-flv";
+    case ".pdf":
+      return "application/pdf";
+    case ".zip":
+      return "application/zip";
+    default:
+      return "application/octet-stream";
+  }
+}
+
+/**
+ * Main request handler
  */
 app.get("*", async (req, res) => {
   try {
@@ -54,7 +82,7 @@ app.get("*", async (req, res) => {
     const assetPath = req.path.replace(/^\/+/, "");
 
     /**
-     * 🚫 BYPASS NON-IMAGES (VIDEOS, PDFs, etc.)
+     * 🚫 BYPASS NON-IMAGES (VIDEOS, FILES)
      */
     if (!assetPath.match(/\.(jpg|jpeg|png|webp|avif)$/i)) {
       const file = originals.file(assetPath);
@@ -62,15 +90,19 @@ app.get("*", async (req, res) => {
         return res.status(404).send("Not found");
       }
 
-      res.set("Cache-Control", "public, max-age=31536000, immutable");
+      res.set({
+        "Content-Type": getMimeType(assetPath),
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "Accept-Ranges": "bytes",
+      });
+
       return file.createReadStream().pipe(res);
     }
 
     /**
-     * IMAGE REQUEST
+     * IMAGE HANDLING
      */
     const { w, h, format = "webp", q = 80 } = req.query;
-
     const width = w ? parseInt(w, 10) : undefined;
     const height = h ? parseInt(h, 10) : undefined;
 
@@ -82,7 +114,7 @@ app.get("*", async (req, res) => {
     const cachedFile = cache.file(key);
 
     /**
-     * ✅ CACHE HIT → SERVE FROM CACHE BUCKET
+     * ✅ Cache hit
      */
     if ((await cachedFile.exists())[0]) {
       res.set({
@@ -93,7 +125,7 @@ app.get("*", async (req, res) => {
     }
 
     /**
-     * ❌ CACHE MISS → LOAD ORIGINAL
+     * ❌ Cache miss → process image
      */
     const originalFile = originals.file(assetPath);
     if (!(await originalFile.exists())[0]) {
@@ -102,9 +134,6 @@ app.get("*", async (req, res) => {
 
     const [buffer] = await originalFile.download();
 
-    /**
-     * Resize & convert
-     */
     const output = await sharp(buffer)
       .resize(width, height, {
         fit: "inside",
@@ -113,9 +142,6 @@ app.get("*", async (req, res) => {
       .toFormat(format, { quality: parseInt(q, 10) })
       .toBuffer();
 
-    /**
-     * Save resized image to cache bucket
-     */
     await cachedFile.save(output, {
       contentType: `image/${format}`,
       metadata: {
@@ -123,13 +149,11 @@ app.get("*", async (req, res) => {
       },
     });
 
-    /**
-     * Serve resized image
-     */
     res.set({
       "Content-Type": `image/${format}`,
       "Cache-Control": "public, max-age=31536000, immutable",
     });
+
     res.send(output);
   } catch (err) {
     console.error("Asset processing error:", err);
