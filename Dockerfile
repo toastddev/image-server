@@ -5,8 +5,8 @@ FROM node:20-slim
 WORKDIR /app
 
 # Install only production dependencies
-COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+COPY package.json ./
+RUN npm install --production
 
 # Copy application source
 COPY . .
