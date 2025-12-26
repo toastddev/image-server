@@ -3,32 +3,43 @@ import sharp from "sharp";
 import crypto from "crypto";
 import { Storage } from "@google-cloud/storage";
 
+console.log("Starting image server...");
+
 const app = express();
-const PORT = 8080;
 
-const ORIGINAL_BUCKET = "assets.toastd.in";       // originals bucket
-const CACHE_BUCKET = "toastd-assets-cache";       // resized cache
+app.get("/health", (req, res) => {
+  res.status(200).send("ok");
+});
 
-const storage = new Storage();
+const ORIGINAL_BUCKET = "assets.toastd.in";
+const CACHE_BUCKET = "toastd-assets-cache";
+
+let storage;
+try {
+  storage = new Storage();
+  console.log("GCS client initialized");
+} catch (err) {
+  console.error("GCS init failed:", err);
+  process.exit(1);
+}
+
 const originals = storage.bucket(ORIGINAL_BUCKET);
 const cache = storage.bucket(CACHE_BUCKET);
 
-// Build cache key
-function getCachePath(path, query) {
+function cacheKey(path, query) {
   const hash = crypto
     .createHash("md5")
     .update(JSON.stringify(query))
     .digest("hex");
 
-  return `cache${path}.${hash}`;
+  return `cache/${path}.${hash}`;
 }
 
 app.get("*", async (req, res) => {
   try {
-    const imagePath = req.path.replace(/^\/+/, ""); // remove leading /
+    const imagePath = req.path.replace(/^\/+/, "");
     const { w, h, format = "webp", q = 80 } = req.query;
 
-    // 🚀 NO PARAMS → SERVE ORIGINAL
     if (!w && !h && !format) {
       const file = originals.file(imagePath);
       const [exists] = await file.exists();
@@ -39,39 +50,35 @@ app.get("*", async (req, res) => {
       return;
     }
 
-    // Validate sizes
     const width = w ? parseInt(w) : undefined;
     const height = h ? parseInt(h) : undefined;
+
     if (width > 2000 || height > 2000) {
-      return res.status(400).send("Image size too large");
+      return res.status(400).send("Image too large");
     }
 
-    // Check cache
-    const cachePath = getCachePath(imagePath, req.query);
-    const cachedFile = cache.file(cachePath);
-    const [cachedExists] = await cachedFile.exists();
+    const key = cacheKey(imagePath, req.query);
+    const cached = cache.file(key);
 
+    const [cachedExists] = await cached.exists();
     if (cachedExists) {
       res.set("Cache-Control", "public, max-age=31536000, immutable");
-      cachedFile.createReadStream().pipe(res);
+      cached.createReadStream().pipe(res);
       return;
     }
 
-    // Cache miss → read original
-    const originalFile = originals.file(imagePath);
-    const [exists] = await originalFile.exists();
+    const original = originals.file(imagePath);
+    const [exists] = await original.exists();
     if (!exists) return res.status(404).send("Not found");
 
-    const [buffer] = await originalFile.download();
+    const [buffer] = await original.download();
 
-    // Resize
     const output = await sharp(buffer)
       .resize(width, height, { fit: "inside", withoutEnlargement: true })
       .toFormat(format, { quality: parseInt(q) })
       .toBuffer();
 
-    // Save to cache bucket
-    await cachedFile.save(output, {
+    await cached.save(output, {
       contentType: `image/${format}`,
       metadata: {
         cacheControl: "public, max-age=31536000, immutable",
@@ -82,11 +89,12 @@ app.get("*", async (req, res) => {
     res.set("Content-Type", `image/${format}`);
     res.send(output);
   } catch (err) {
-    console.error(err);
-    res.status(500).send("Image processing failed");
+    console.error("Request error:", err);
+    res.status(500).send("Processing failed");
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Image server running on ${PORT}`);
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Image server running on port ${PORT}`);
 });
