@@ -1,6 +1,7 @@
 {
   "name": "image-server",
   "version": "1.0.0",
+  "type": "module",
   "description": "\"# image-server\"",
   "main": "server.js",
   "scripts": {
