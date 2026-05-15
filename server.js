@@ -46,6 +46,27 @@ function cacheKey(filePath, query) {
 }
 
 /**
+ * Send a non-cacheable 404. Browsers and our CDN otherwise cache the miss,
+ * so a transient race between presigned upload commit and read would freeze
+ * a broken thumbnail until cache expiry — even after the object is in place.
+ */
+function send404(res) {
+  res.set("Cache-Control", "no-store, must-revalidate");
+  return res.status(404).send("Not found");
+}
+
+/**
+ * Check `file.exists()` once, and if it returns false retry once after a short
+ * backoff. Covers the brief window where a freshly written GCS object isn't yet
+ * visible to a parallel reader on a cold Cloud Run instance.
+ */
+async function existsWithRetry(file, delayMs = 300) {
+  if ((await file.exists())[0]) return true;
+  await new Promise((r) => setTimeout(r, delayMs));
+  return (await file.exists())[0];
+}
+
+/**
  * MIME type resolver for non-image assets
  */
 function getMimeType(filePath) {
@@ -86,8 +107,8 @@ app.get("*", async (req, res) => {
      */
     if (!assetPath.match(/\.(jpg|jpeg|png|webp|avif)$/i)) {
       const file = originals.file(assetPath);
-      if (!(await file.exists())[0]) {
-        return res.status(404).send("Not found");
+      if (!(await existsWithRetry(file))) {
+        return send404(res);
       }
 
       res.set({
@@ -128,8 +149,8 @@ app.get("*", async (req, res) => {
      * ❌ Cache miss → process image
      */
     const originalFile = originals.file(assetPath);
-    if (!(await originalFile.exists())[0]) {
-      return res.status(404).send("Not found");
+    if (!(await existsWithRetry(originalFile))) {
+      return send404(res);
     }
 
     const [buffer] = await originalFile.download();
