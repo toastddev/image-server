@@ -16,6 +16,13 @@ app.get("/health", (_, res) => {
 const ORIGINAL_BUCKET = "assets.toastd.in";
 const CACHE_BUCKET = "toastd-assets-cache";
 
+/**
+ * Output formats we accept. The `Content-Type` is built as `image/<format>`, so
+ * every entry here also has to be a valid MIME subtype. `jpg` is intentionally
+ * excluded — callers should use `jpeg` to get the correct `image/jpeg`.
+ */
+const ALLOWED_FORMATS = new Set(["webp", "avif", "jpeg", "png"]);
+
 let storage;
 let originals;
 let cache;
@@ -124,8 +131,26 @@ app.get("*", async (req, res) => {
      * IMAGE HANDLING
      */
     const { w, h, format = "webp", q = 80 } = req.query;
-    const width = w ? parseInt(w, 10) : undefined;
-    const height = h ? parseInt(h, 10) : undefined;
+
+    // Allowlist the output format so an unknown value is a clean 400, not a
+    // 500 thrown from deep inside sharp.toFormat().
+    if (!ALLOWED_FORMATS.has(format)) {
+      return res.status(400).send("Unsupported format");
+    }
+
+    // Reject non-numeric w/h/q up front. Without this, `?w=abc` becomes NaN,
+    // reaches sharp and surfaces as a confusing 500.
+    const width = w !== undefined ? parseInt(w, 10) : undefined;
+    const height = h !== undefined ? parseInt(h, 10) : undefined;
+    const quality = parseInt(q, 10);
+
+    if ((w !== undefined && !Number.isFinite(width)) ||
+        (h !== undefined && !Number.isFinite(height))) {
+      return res.status(400).send("Invalid w/h");
+    }
+    if (!Number.isFinite(quality) || quality < 1 || quality > 100) {
+      return res.status(400).send("Invalid q");
+    }
 
     if ((width && width > 2000) || (height && height > 2000)) {
       return res.status(400).send("Image too large");
@@ -160,7 +185,7 @@ app.get("*", async (req, res) => {
         fit: "inside",
         withoutEnlargement: true,
       })
-      .toFormat(format, { quality: parseInt(q, 10) })
+      .toFormat(format, { quality })
       .toBuffer();
 
     await cachedFile.save(output, {

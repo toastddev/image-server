@@ -304,6 +304,8 @@ would otherwise leave a broken thumbnail pinned in the browser and CDN until exp
 |---|---|---|
 | `200` | asset bytes | OK |
 | `400` | `Image too large` | `w` or `h` above 2000 |
+| `400` | `Unsupported format` | `format` not in `webp`/`avif`/`jpeg`/`png` |
+| `400` | `Invalid w/h` / `Invalid q` | Non-numeric `w`/`h`, or `q` non-numeric / outside 1–100 |
 | `404` | `Not found` | Object missing from the originals bucket (after one retry) |
 | `500` | `Processing failed` | sharp/GCS error — invalid `format`, non-numeric `w`/`h`, corrupt source, IAM failure. Details are logged server-side. |
 
@@ -358,27 +360,49 @@ AVIF with a WebP fallback:
 
 ### Next.js / custom loader
 
-```js
-// next.config.js
-module.exports = {
-  images: {
-    loader: "custom",
-    loaderFile: "./toastdLoader.js",
-  },
-};
-```
+The Toastd web app (`new toastd`) routes **all** `next/image` requests through this
+server with a custom loader, instead of Next's built-in `/_next/image`. That stops
+Next from downloading each full-size original and re-encoding it on the app server —
+the browser requests the exact display width straight from this CDN-cached service.
 
 ```js
-// toastdLoader.js
-export default function toastdLoader({ src, width, quality }) {
-  const params = new URLSearchParams({
-    w: String(width),
-    q: String(quality || 80),
-    format: "webp",
-  });
-  return `https://assets.toastd.in/${src.replace(/^\/+/, "")}?${params}`;
+// next.config.mjs
+const nextConfig = {
+  images: {
+    loader: "custom",
+    loaderFile: "./src/lib/image-loader.ts",
+    // The only widths Next will request — keep the warm script's WIDTHS in sync.
+    imageSizes: [96, 183, 280, 384],
+    deviceSizes: [549, 640, 750, 828, 1080, 1200, 1500, 2000],
+    minimumCacheTTL: 31536000,
+  },
+};
+export default nextConfig;
+```
+
+```ts
+// src/lib/image-loader.ts  (abridged — see the app repo for the full file)
+const IMAGE_FORMAT = process.env.NEXT_PUBLIC_IMAGE_FORMAT ?? "avif";
+const IMAGE_QUALITY = Number(process.env.NEXT_PUBLIC_IMAGE_QUALITY ?? 50);
+
+export default function toastdImageLoader({ src, width }) {
+  if (!src.includes("assets.toastd.in")) return src;          // pass others through
+  const url = new URL(src);
+  if (!/\.(jpe?g|png|webp|avif)$/i.test(url.pathname)) return src; // videos etc.
+  const w = Math.min(Math.max(1, Math.round(width)), 2000);   // server caps at 2000
+  url.searchParams.set("w", String(w));
+  url.searchParams.set("format", IMAGE_FORMAT);
+  url.searchParams.set("q", String(IMAGE_QUALITY));
+  return url.toString();
 }
 ```
+
+> **Format & quality are set centrally in the loader, not per `<Image>` call.** That
+> guarantees every requested width hashes to a cache key the [warm script](#warming-the-cache)
+> can pre-generate. AVIF is the default for the best Lighthouse scores; because the
+> first AVIF encode is slow, warm the cache after uploads so shoppers only ever hit
+> pre-generated derivatives. Param order (`w`, `format`, `q`) is significant — it must
+> match the warm script so both hash to the same object.
 
 ### CSS background images
 
@@ -415,6 +439,43 @@ Clearing the derivative cache is safe at any time; it rebuilds on demand:
 gcloud storage rm -r gs://toastd-assets-cache/cache/**       # nuke everything
 gcloud storage ls gs://toastd-assets-cache/cache/ | head     # inspect
 ```
+
+---
+
+## Warming the cache
+
+`scripts/warm-cache.mjs` pre-generates the full width × format matrix for every image
+so the first shopper hit is always a cache hit — this is what makes AVIF (slow on the
+first encode) safe to serve as the app's default. It drives the real HTTP endpoint, so
+it reuses the exact cache-key logic of live traffic; there's no chance of warming an
+object under a key the app won't ask for.
+
+```bash
+npm run warm                                   # warm the whole originals bucket
+node scripts/warm-cache.mjs --prefix greenhermitage/   # one brand
+node scripts/warm-cache.mjs --from-file paths.txt      # explicit path list
+node scripts/warm-cache.mjs --dry-run          # count the work, request nothing
+```
+
+**Paths** come from listing the originals bucket by default, or from a newline-separated
+file (bare object paths *or* full `assets.toastd.in` URLs — e.g. a dump of the app DB's
+`product_image.url`). **The width/format/quality matrix must match the Next.js loader**
+(`imageSizes` + `deviceSizes`, and the loader's `format`/`quality`); override with env if
+you change the loader:
+
+| Env | Default | Notes |
+|---|---|---|
+| `BASE_URL` | `https://assets.toastd.in` | Endpoint to warm (put the CDN in front so hits are cheap). |
+| `WIDTHS` | `96,183,280,384,549,640,750,828,1080,1200,1500,2000` | Must equal Next's `imageSizes + deviceSizes`. |
+| `FORMATS` | `avif` | Comma list; add `webp` to warm a fallback too. |
+| `IMAGE_QUALITY` | `50` | Must match the loader's quality. |
+| `CONCURRENCY` | `16` | Parallel requests. |
+| `ORIGINAL_BUCKET` | `assets.toastd.in` | Bucket listed when no `--from-file`. |
+
+**Making future uploads "already optimized":** run the warmer as the last step of your
+upload pipeline (scope it with `--from-file` listing just the new paths, or `--prefix`),
+or on a schedule as a Cloud Run Job. Because the cache bucket has a 90-day lifecycle,
+a periodic full warm also keeps hot paths from ever expiring to a cold miss.
 
 ---
 
@@ -503,14 +564,18 @@ There is no `.env` file in use; the bucket names are constants in `server.js`.
 
 ## Known limitations
 
-- **`format` is not validated.** Any string goes straight to `sharp.toFormat()`; an unknown
-  value throws and returns `500`. An allowlist would turn it into a `400`.
-- **`Content-Type` mirrors the raw `format` value**, so `?format=jpg` emits the
-  non-standard `image/jpg`. Use `?format=jpeg`.
+- **`format` is allowlisted** to `webp`, `avif`, `jpeg`, `png`. Anything else is a clean
+  `400 Unsupported format` (previously an unknown value threw a `500`). Extend
+  `ALLOWED_FORMATS` in `server.js` to accept more.
+- **`Content-Type` mirrors the `format` value.** With the allowlist above every accepted
+  value is already a valid MIME subtype; `jpg` is intentionally excluded so callers use
+  `jpeg` and get the correct `image/jpeg`.
+- **Non-numeric `w`/`h`/`q`** now return `400 Invalid w/h` / `400 Invalid q` instead of
+  reaching sharp and surfacing as a `500`. `q` is also range-checked to 1–100.
 - **Cache keys are query-order sensitive** — `?w=183&q=80` and `?q=80&w=183` hash
-  differently and store two identical objects. Sort the params before hashing to fix.
-- **Non-numeric `w`/`h`** (`?w=abc`) become `NaN` and reach sharp, producing a `500` rather
-  than a `400`.
+  differently and store two identical objects. The Next.js loader and warm script both
+  emit params in a fixed `w,format,q` order to stay consistent; sort the params before
+  hashing if you need order-independence for hand-written URLs.
 - **No cropping.** `fit` is hardcoded to `"inside"`, so exact square/fixed-ratio output is
   not possible; a `fit=cover` parameter would need to be added.
 - **No cache invalidation endpoint** — clear objects from `toastd-assets-cache` manually.
@@ -526,6 +591,8 @@ There is no `.env` file in use; the bucket names are constants in `server.js`.
 .
 ├── server.js         # the service (routing, resize, cache, passthrough)
 ├── server copy.js    # earlier revision, kept for reference — not deployed
+├── scripts/
+│   └── warm-cache.mjs  # pre-generate derivatives so first hits are cache hits
 ├── package.json
 ├── Dockerfile        # node:20-slim, production deps, port 8080
 ├── lifecycle.json    # 90-day delete rule for the cache bucket
